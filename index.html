@@ -72,21 +72,6 @@
             el.scrollTop = el.scrollHeight;
         };
 
-        // Standard CSV formatting for labels (only quote if contains comma or quotes)
-        const formatLabel = (text) => {
-            if (!text) return '';
-            if (text.includes(',') || text.includes('"')) {
-                return '"' + text.replace(/"/g, '""') + '"';
-            }
-            return text;
-        };
-
-        // Strict quoting for string statements per QS requirements
-        const formatStringStatement = (text) => {
-            if (!text) return '';
-            return '"' + text.replace(/"/g, '""') + '"';
-        };
-
         async function checkP12749(wdId) {
             try {
                 const res = await fetch(`https://www.wikidata.org/w/api.php?action=wbgetentities&ids=${wdId}&props=claims&format=json&origin=*`);
@@ -131,14 +116,17 @@
                 const Den = entity.descriptions?.en?.value;
                 const Dcy = entity.descriptions?.cy?.value;
 
-                if (Len) { headers.push('Len'); row.push(formatLabel(Len)); }
-                if (Lcy) { headers.push('Lcy'); row.push(formatLabel(Lcy)); }
-                if (Den) { headers.push('Den'); row.push(formatLabel(Den)); }
-                if (Dcy) { headers.push('Dcy'); row.push(formatLabel(Dcy)); }
+                // Labels don't get forced quotes unless PapaParse sees a comma inside them.
+                if (Len) { headers.push('Len'); row.push(Len); }
+                if (Lcy) { headers.push('Lcy'); row.push(Lcy); }
+                if (Den) { headers.push('Den'); row.push(Den); }
+                if (Dcy) { headers.push('Dcy'); row.push(Dcy); }
 
                 // 2. Generate P62 Statement with full Wikidata URL
+                // By wrapping the string in double quotes natively here, PapaParse will automatically escape 
+                // it into the correct """url""" format for QuickStatements CSV.
                 headers.push('P62');
-                row.push(formatStringStatement(`http://www.wikidata.org/entity/${qid}`));
+                row.push('"' + `http://www.wikidata.org/entity/${qid}` + '"');
 
                 // 3. Process Mapped Claims
                 for (const [prop, claims] of Object.entries(entity.claims)) {
@@ -147,7 +135,8 @@
 
                     for (const claim of claims) {
                         const val = claim.mainsnak.datavalue?.value;
-                        if (!val) continue;
+                        // Strict check to ensure 0s are not falsy-skipped
+                        if (val === undefined || val === null || val === '') continue;
 
                         let finalValue = null;
 
@@ -165,22 +154,29 @@
                                 }
                             }
                         } else if (val.time) { // Dates/Times
-                            finalValue = formatStringStatement(`${val.time}/${val.precision}`);
+                            // Dates do NOT receive quotes
+                            finalValue = `${val.time}/${val.precision}`;
                         } else if (val.text && val.language) { // Monolingual text
-                            finalValue = formatStringStatement(`${val.language}:"${val.text}"`);
-                        } else { // Standard Strings (and P18 Images)
-                            finalValue = formatStringStatement(val);
+                            // QuickStatements format: en:"text"
+                            finalValue = `${val.language}:"${val.text}"`;
+                        } else if (typeof val === 'object' && val.amount !== undefined) {
+                            // Quantity
+                            finalValue = val.amount;
+                        } else { // Standard Strings, Identifiers, P18 Images
+                            // Force explicit QuickStatements quotes. 
+                            // PapaParse will escape this so it shows up as """string""" in the raw CSV.
+                            finalValue = '"' + String(val) + '"';
                         }
 
-                        if (finalValue) {
+                        if (finalValue !== null) {
                             headers.push(snarcProp);
                             row.push(finalValue);
                         }
                     }
                 }
 
-                // Compile CSV manually to enforce duplicate headers and explicit quoting rules
-                const csvOutput = headers.join(',') + '\n' + row.join(',');
+                // Compile CSV using PapaParse so it properly encodes the quotes and commas automatically
+                const csvOutput = Papa.unparse([headers, row]);
                 
                 downloadBlob(csvOutput, `${qid}_quickstatements.csv`, 'text/csv');
                 log(`✅ Successfully generated CSV for ${qid}.`);
