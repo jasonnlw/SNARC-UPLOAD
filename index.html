@@ -116,15 +116,12 @@
                 const Den = entity.descriptions?.en?.value;
                 const Dcy = entity.descriptions?.cy?.value;
 
-                // Labels don't get forced quotes unless PapaParse sees a comma inside them.
                 if (Len) { headers.push('Len'); row.push(Len); }
                 if (Lcy) { headers.push('Lcy'); row.push(Lcy); }
                 if (Den) { headers.push('Den'); row.push(Den); }
                 if (Dcy) { headers.push('Dcy'); row.push(Dcy); }
 
                 // 2. Generate P62 Statement with full Wikidata URL
-                // By wrapping the string in double quotes natively here, PapaParse will automatically escape 
-                // it into the correct """url""" format for QuickStatements CSV.
                 headers.push('P62');
                 row.push('"' + `http://www.wikidata.org/entity/${qid}` + '"');
 
@@ -154,17 +151,16 @@
                                 }
                             }
                         } else if (val.time) { // Dates/Times
-                            // Dates do NOT receive quotes
                             finalValue = `${val.time}/${val.precision}`;
                         } else if (val.text && val.language) { // Monolingual text
-                            // QuickStatements format: en:"text"
                             finalValue = `${val.language}:"${val.text}"`;
-                        } else if (typeof val === 'object' && val.amount !== undefined) {
-                            // Quantity
+                        } else if (typeof val === 'object' && val.latitude !== undefined && val.longitude !== undefined) { // Coordinates
+                            // Quickstatements format: @lat/long (No quotes required)
+                            finalValue = `@${val.latitude}/${val.longitude}`;
+                        } else if (typeof val === 'object' && val.amount !== undefined) { // Quantity
                             finalValue = val.amount;
                         } else { // Standard Strings, Identifiers, P18 Images
                             // Force explicit QuickStatements quotes. 
-                            // PapaParse will escape this so it shows up as """string""" in the raw CSV.
                             finalValue = '"' + String(val) + '"';
                         }
 
