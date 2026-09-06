@@ -1,0 +1,31 @@
+name: VanderBot Upload
+
+on:
+  push:
+    paths:
+      - 'data/upload_data.csv'
+      - 'data/csv-metadata.json'
+
+jobs:
+  upload-to-wikibase:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Create Credentials File
+        run: |
+          echo "${{ secrets.WIKIBASE_CREDENTIALS }}" > wikibase_credentials.txt
+
+      - name: Execute VanderBot
+        run: |
+          cd data
+          python ../vanderbot.py --path ../ --credentials wikibase_credentials.txt --json csv-metadata.json
