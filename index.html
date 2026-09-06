@@ -6,22 +6,40 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.3.2/papaparse.min.js"></script>
     <style>
         body { font-family: system-ui, sans-serif; max-width: 800px; margin: 2rem auto; padding: 0 1rem; }
-        textarea { width: 100%; height: 100px; margin-bottom: 1rem; padding: 0.5rem; }
-        button { padding: 0.5rem 1rem; background: #0366d6; color: white; border: none; cursor: pointer; }
+        textarea, input { width: 100%; margin-bottom: 1rem; padding: 0.5rem; box-sizing: border-box; }
+        textarea { height: 100px; }
+        button { padding: 0.5rem 1rem; background: #0366d6; color: white; border: none; cursor: pointer; margin-right: 0.5rem; }
         button:hover { background: #005cc5; }
-        .log { background: #f6f8fa; padding: 1rem; white-space: pre-wrap; font-family: monospace; }
+        button:disabled { background: #ccc; cursor: not-allowed; }
+        .log { background: #f6f8fa; padding: 1rem; white-space: pre-wrap; font-family: monospace; max-height: 300px; overflow-y: auto; }
         .error { color: #d73a49; font-weight: bold; }
+        .warning { color: #b08800; }
+        .panel { border: 1px solid #ddd; padding: 1rem; margin-top: 1rem; border-radius: 5px; }
     </style>
 </head>
 <body>
     <h2>Wikidata to SNARC Mapper</h2>
-    <p>Enter Wikidata QIDs (comma or newline separated):</p>
-    <textarea id="qids" placeholder="Q42, Q6581097..."></textarea>
-    <button onclick="processItems()">Map Data & Generate Files</button>
+    
+    <div class="panel">
+        <p><strong>1. Enter Wikidata QIDs (comma or newline separated):</strong></p>
+        <textarea id="qids" placeholder="Q42, Q6581097..."></textarea>
+        <button onclick="processItems()" id="btnProcess">Map Data & Generate Files</button>
+    </div>
+
+    <div class="panel" id="uploadPanel" style="display: none;">
+        <p><strong>2. Upload to GitHub (Triggers VanderBot)</strong></p>
+        <input type="text" id="ghRepo" placeholder="username/repository (e.g., octocat/my-wikibase-data)">
+        <input type="password" id="ghToken" placeholder="GitHub Personal Access Token (PAT)">
+        <button onclick="uploadToGitHub()" id="btnUpload">Upload Now</button>
+        <p style="font-size: 0.85em; color: #666;">Credentials remain in your browser memory and are used to commit the generated files to the <code>data/</code> folder, triggering the Action.</p>
+    </div>
+
     <div id="output" class="log" style="margin-top:1rem;"></div>
 
     <script>
         const maps = {};
+        let generatedCsv = '';
+        let generatedJson = '';
         const mapFiles = [
             'Mappings for WD-SNARC tool - Property Map.csv',
             'Mappings for WD-SNARC tool - Occupations Map.csv',
@@ -31,50 +49,58 @@
             'Mappings for WD-SNARC tool - Language Map.csv'
         ];
 
-        // Load all maps on startup
         async function loadMaps() {
             for (const file of mapFiles) {
-                const response = await fetch(file);
-                const csv = await response.text();
-                Papa.parse(csv, {
-                    header: true,
-                    complete: function(results) {
-                        const key = file.includes('Property') ? 'Property' : 'Entity';
-                        if (!maps[key]) maps[key] = {};
-                        results.data.forEach(row => {
-                            const values = Object.values(row);
-                            if(values[0] && values[1]) maps[key][values[0].trim()] = values[1].trim();
-                        });
-                    }
-                });
+                try {
+                    const response = await fetch(file);
+                    if (!response.ok) continue;
+                    const csv = await response.text();
+                    Papa.parse(csv, {
+                        header: true,
+                        complete: function(results) {
+                            const key = file.includes('Property') ? 'Property' : 'Entity';
+                            if (!maps[key]) maps[key] = {};
+                            results.data.forEach(row => {
+                                const values = Object.values(row);
+                                if(values[0] && values[1]) maps[key][values[0].trim()] = values[1].trim();
+                            });
+                        }
+                    });
+                } catch (e) {
+                    console.warn(`Failed to load ${file}`);
+                }
             }
-            // Hardcoded P21 mappings
             if (!maps['Entity']) maps['Entity'] = {};
             maps['Entity']['Q6581097'] = 'Q33';
             maps['Entity']['Q6581072'] = 'Q34';
         }
         loadMaps();
 
-        const log = (msg, isError = false) => {
+        const log = (msg, type = 'info') => {
             const el = document.getElementById('output');
-            el.innerHTML += `<span class="${isError ? 'error' : ''}">${msg}</span><br>`;
+            let colorClass = type === 'error' ? 'error' : (type === 'warning' ? 'warning' : '');
+            el.innerHTML += `<span class="${colorClass}">${msg}</span><br>`;
+            el.scrollTop = el.scrollHeight;
         };
-
         const sleep = ms => new Promise(r => setTimeout(r, ms));
 
         async function processItems() {
             document.getElementById('output').innerHTML = '';
+            document.getElementById('uploadPanel').style.display = 'none';
             const input = document.getElementById('qids').value;
             const qids = input.split(/[\s,]+/).filter(q => q.match(/^Q\d+$/i));
             
-            if (qids.length === 0) return log('No valid QIDs found.', true);
+            if (qids.length === 0) return log('No valid QIDs found.', 'error');
             log(`Processing ${qids.length} items...`);
 
-            // Use bulk fetch logic for sets larger than 10
             const batchSize = qids.length > 10 ? 50 : 10;
             let rows = [];
-            let columns = new Set(['item']);
-            let missingData = [];
+            // Core columns based on VanderBot specification
+            let columns = ['qid', 'Len', 'Lcy', 'Den', 'Dcy']; 
+            let propertyColumnTypes = {}; // Tracks if a column holds an entity, string, or url
+            
+            // Map Wikidata property values per item
+            let itemDataMap = {}; 
 
             for (let i = 0; i < qids.length; i += batchSize) {
                 const batch = qids.slice(i, i + batchSize);
@@ -83,74 +109,151 @@
                 try {
                     const res = await fetch(url);
                     const data = await res.json();
-                    await sleep(qids.length > 10 ? 1000 : 200); // Throttle bulk calls
+                    await sleep(qids.length > 10 ? 1000 : 200); 
 
                     for (const qid of batch) {
                         const entity = data.entities[qid];
                         if (!entity || entity.missing) continue;
                         
-                        let row = { item: qid };
+                        let row = { 
+                            qid: qid,
+                            Len: entity.labels?.en?.value || '',
+                            Lcy: entity.labels?.cy?.value || '',
+                            Den: entity.descriptions?.en?.value || '',
+                            Dcy: entity.descriptions?.cy?.value || ''
+                        };
+
                         for (const [prop, claims] of Object.entries(entity.claims)) {
                             const snarcProp = maps['Property'][prop];
                             if (!snarcProp) continue;
 
-                            columns.add(snarcProp);
-                            const val = claims[0].mainsnak.datavalue?.value;
-                            
-                            if (val?.id) { // Entity
-                                let mappedEntity = maps['Entity'][val.id];
-                                if (!mappedEntity) {
-                                    // P12749 Fallback check
-                                    const fallbackRes = await fetch(`https://www.wikidata.org/w/api.php?action=wbgetentities&ids=${val.id}&props=claims&format=json&origin=*`);
-                                    const fallbackData = await fallbackRes.json();
-                                    const p12749 = fallbackData.entities[val.id]?.claims['P12749'];
-                                    mappedEntity = p12749 ? p12749[0].mainsnak.datavalue.value : null;
+                            // Handle multiple claims for the same property
+                            claims.forEach((claim, index) => {
+                                const val = claim.mainsnak.datavalue?.value;
+                                if (!val) return;
+
+                                // Indexed property name (e.g., P15-1, P15-2) if multiple, otherwise just P15
+                                const colName = claims.length > 1 ? `${snarcProp}-${index + 1}` : snarcProp;
+                                const uuidCol = `${colName}_uuid`;
+                                
+                                if (!columns.includes(colName)) {
+                                    columns.push(uuidCol, colName);
                                 }
-                                if (mappedEntity) {
-                                    row[snarcProp] = mappedEntity;
+
+                                row[uuidCol] = ''; // Vanderbot fills this upon creation
+                                
+                                if (val.id) { 
+                                    propertyColumnTypes[colName] = 'entity';
+                                    let mappedEntity = maps['Entity'][val.id];
+                                    
+                                    if (mappedEntity) {
+                                        row[colName] = mappedEntity;
+                                    } else {
+                                        // Await API check for P12749 logic handles later to prevent blocking loop too aggressively, 
+                                        // but for simplicity in browser, we check it inline.
+                                        row[colName] = 'PENDING_CHECK:' + val.id; 
+                                    }
                                 } else {
-                                    missingData.push(`${qid}: Missing mapping for ${val.id}`);
-                                    row[snarcProp] = val.id; // Pass original string
+                                    propertyColumnTypes[colName] = val.time ? 'string' : (typeof val === 'string' && val.startsWith('http') ? 'url' : 'string');
+                                    row[colName] = val.time || val;
                                 }
-                            } else {
-                                // Strings, Dates, URLs
-                                row[snarcProp] = val.time || val;
-                            }
+                            });
                         }
-                        rows.push(row);
+                        itemDataMap[qid] = row;
                     }
                 } catch (err) {
-                    log(`API Error: ${err.message}`, true);
+                    log(`API Error: ${err.message}`, 'error');
                 }
             }
 
-            if (missingData.length > 0) {
-                log('Missing Mappings Found:', true);
-                missingData.forEach(m => log(m, true));
+            // Resolve missing mappings via P12749
+            for (let qid of Object.keys(itemDataMap)) {
+                let row = itemDataMap[qid];
+                for (let col of columns) {
+                    if (row[col] && typeof row[col] === 'string' && row[col].startsWith('PENDING_CHECK:')) {
+                        const targetId = row[col].split(':')[1];
+                        try {
+                            const fallbackRes = await fetch(`https://www.wikidata.org/w/api.php?action=wbgetentities&ids=${targetId}&props=claims&format=json&origin=*`);
+                            const fallbackData = await fallbackRes.json();
+                            const p12749 = fallbackData.entities[targetId]?.claims['P12749'];
+                            
+                            if (p12749) {
+                                row[col] = p12749[0].mainsnak.datavalue.value;
+                            } else {
+                                log(`Missing mapping for ${targetId} on item ${qid}. Value left blank.`, 'warning');
+                                row[col] = ''; // Leave blank per instructions
+                            }
+                        } catch(e) {
+                            row[col] = '';
+                        }
+                        await sleep(100); // polite delay
+                    }
+                }
+                rows.push(row);
             }
 
-            generateFiles(rows, Array.from(columns));
+            generateFiles(rows, columns, propertyColumnTypes);
         }
 
-        function generateFiles(rows, columns) {
-            const csv = Papa.unparse(rows, { columns });
+        function generateFiles(rows, columns, propertyColumnTypes) {
+            generatedCsv = Papa.unparse(rows, { columns });
+            
+            // Build the schema conforming strictly to VanderBot formatting
+            const jsonColumns = [
+                { "titles": "qid", "name": "qid", "datatype": "string", "suppressOutput": true },
+                { "titles": "Len", "name": "Len", "datatype": "string", "aboutUrl": "http://www.wikidata.org/entity/{qid}", "propertyUrl": "rdfs:label", "lang": "en" },
+                { "titles": "Lcy", "name": "Lcy", "datatype": "string", "aboutUrl": "http://www.wikidata.org/entity/{qid}", "propertyUrl": "rdfs:label", "lang": "cy" },
+                { "titles": "Den", "name": "Den", "datatype": "string", "aboutUrl": "http://www.wikidata.org/entity/{qid}", "propertyUrl": "schema:description", "lang": "en" },
+                { "titles": "Dcy", "name": "Dcy", "datatype": "string", "aboutUrl": "http://www.wikidata.org/entity/{qid}", "propertyUrl": "schema:description", "lang": "cy" }
+            ];
+
+            columns.forEach(col => {
+                if (col.endsWith('_uuid')) {
+                    const baseProp = col.replace('_uuid', '').split('-')[0]; // Extract 'P15' from 'P15-1'
+                    jsonColumns.push({
+                        "titles": col,
+                        "name": col,
+                        "datatype": "string",
+                        "aboutUrl": "http://www.wikidata.org/entity/{qid}",
+                        "propertyUrl": `http://www.wikidata.org/prop/${baseProp}`,
+                        "valueUrl": `http://www.wikidata.org/entity/statement/{qid}-{${col}}`
+                    });
+                } else if (col !== 'qid' && col !== 'Len' && col !== 'Lcy' && col !== 'Den' && col !== 'Dcy') {
+                    const baseProp = col.split('-')[0];
+                    let colConfig = {
+                        "titles": col,
+                        "name": col,
+                        "datatype": "string",
+                        "aboutUrl": `http://www.wikidata.org/entity/statement/{qid}-{${col}_uuid}`,
+                        "propertyUrl": `http://www.wikidata.org/prop/statement/${baseProp}`
+                    };
+
+                    if (propertyColumnTypes[col] === 'entity') {
+                        colConfig.valueUrl = `http://www.wikidata.org/entity/{${col}}`;
+                    } else if (propertyColumnTypes[col] === 'url') {
+                        colConfig.valueUrl = `{+${col}}`;
+                    }
+                    // For standard literal strings, valueUrl is omitted
+                    jsonColumns.push(colConfig);
+                }
+            });
+
             const jsonSchema = {
+                "@type": "TableGroup",
                 "@context": "http://www.w3.org/ns/csvw",
                 "tables": [{
                     "url": "upload_data.csv",
-                    "tableSchema": {
-                        "aboutUrl": "http://localhost/entity/{item}",
-                        "columns": columns.map(col => col === 'item' ? 
-                            { "titles": "item", "name": "item", "datatype": "string" } : 
-                            { "titles": col, "propertyUrl": `http://www.wikidata.org/prop/statement/${col}`, "valueUrl": "{"+col+"}" }
-                        )
-                    }
+                    "tableSchema": { "columns": jsonColumns }
                 }]
             };
 
-            downloadBlob(csv, 'upload_data.csv', 'text/csv');
-            downloadBlob(JSON.stringify(jsonSchema, null, 2), 'csv-metadata.json', 'application/json');
+            generatedJson = JSON.stringify(jsonSchema, null, 4);
+
+            downloadBlob(generatedCsv, 'upload_data.csv', 'text/csv');
+            downloadBlob(generatedJson, 'csv-metadata.json', 'application/json');
+            
             log('✅ Files generated and downloaded successfully.');
+            document.getElementById('uploadPanel').style.display = 'block';
         }
 
         function downloadBlob(content, filename, contentType) {
@@ -161,6 +264,54 @@
             a.download = filename;
             a.click();
             URL.revokeObjectURL(url);
+        }
+
+        async function uploadToGitHub() {
+            const repo = document.getElementById('ghRepo').value.trim();
+            const token = document.getElementById('ghToken').value.trim();
+            if (!repo || !token) return log('Repository and Token are required.', 'error');
+            
+            document.getElementById('btnUpload').disabled = true;
+            log('Uploading files to GitHub...');
+
+            try {
+                await commitFile(repo, token, 'data/upload_data.csv', generatedCsv);
+                await commitFile(repo, token, 'data/csv-metadata.json', generatedJson);
+                log('✅ Successfully uploaded files to GitHub. VanderBot Action triggered.');
+            } catch (err) {
+                log(`Upload failed: ${err.message}`, 'error');
+            }
+            document.getElementById('btnUpload').disabled = false;
+        }
+
+        async function commitFile(repo, token, path, content) {
+            // Check if file exists to get SHA (required for updating existing files)
+            let sha = '';
+            const getRes = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, {
+                headers: { 'Authorization': `token ${token}` }
+            });
+            if (getRes.ok) {
+                const getData = await getRes.json();
+                sha = getData.sha;
+            }
+
+            const putRes = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, {
+                method: 'PUT',
+                headers: {
+                    'Authorization': `token ${token}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    message: `Auto-upload: update ${path}`,
+                    content: btoa(unescape(encodeURIComponent(content))), // Safe Base64 encoding
+                    sha: sha || undefined
+                })
+            });
+
+            if (!putRes.ok) {
+                const errorText = await putRes.text();
+                throw new Error(errorText);
+            }
         }
     </script>
 </body>
